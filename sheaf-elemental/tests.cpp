@@ -173,6 +173,23 @@ void test_orientation_independence() {
     CHECK(near(dG.transpose() * dG, dF.transpose() * dF));
 }
 
+// The largest gap between grad and the central difference of loss in each entry of p, which loss
+// must read. Exact up to rounding for any step h when loss is at most quadratic in each entry.
+template <class Loss>
+double gradient_error(const Loss& loss, Mat& p, const Mat& grad, double h) {
+    double worst = 0;
+    for (Eigen::Index i = 0; i < p.size(); ++i) {
+        const double p0 = p(i);
+        p(i) = p0 + h;
+        const double up = loss();
+        p(i) = p0 - h;
+        const double down = loss();
+        p(i) = p0;
+        worst = std::max(worst, std::abs((up - down) / (2 * h) - grad(i)));
+    }
+    return worst;
+}
+
 // Gradient check on the sheaf Dirichlet energy E = ½‖δx‖², whose gradient with respect to δx is
 // δx itself. E is quadratic in each parameter, so central differences are exact up to rounding.
 void test_gradients() {
@@ -186,21 +203,52 @@ void test_gradients() {
         const Mat gmaps = map_gradient(delta, x, y);
 
         const auto energy = [&] { return 0.5 * apply(delta, maps, x).squaredNorm(); };
-        const auto numeric = [&](double& p) {
-            const double p0 = p, h = 1e-3;
-            p = p0 + h;
-            const double up = energy();
-            p = p0 - h;
-            const double down = energy();
-            p = p0;
-            return (up - down) / (2 * h);
+        CHECK(gradient_error(energy, x, gx, 1e-3) < 1e-8);
+        CHECK(gradient_error(energy, maps, gmaps, 1e-3) < 1e-8);
+    }
+}
+
+// The upstream gradient δx above lies in the image of δ, a proper subspace of the 1-cochains. A
+// random G reaches every direction. ⟨G, δx⟩ is linear in each parameter, so even a unit step is
+// exact up to rounding.
+void test_gradients_linear() {
+    for (int d : {2, 5}) {
+        const int f = 3;
+        const Delta delta(n, d, bowtie);
+        Mat maps = Mat::Random(2 * delta.num_edges(), d * d);
+        Mat x = Mat::Random(n * d, f);
+        const Mat G = Mat::Random(delta.num_edges() * d, f);
+        const Mat gx = apply_transpose(delta, maps, G);
+        const Mat gmaps = map_gradient(delta, x, G);
+
+        const auto loss = [&] { return G.cwiseProduct(apply(delta, maps, x)).sum(); };
+        CHECK(gradient_error(loss, x, gx, 1.0) < 1e-12);
+        CHECK(gradient_error(loss, maps, gmaps, 1.0) < 1e-12);
+    }
+}
+
+// ⟨H, δ^T δ x⟩ uses every map twice. The δ step y = δx contributes map_gradient(x, gy) with
+// gy = δH. The δ^T step z = δ^T y adds F^T y_e at the head and -F^T y_e at the tail, so given
+// gz = H it contributes y_e H_head^T and -y_e H_tail^T: map_gradient with the vertex and edge
+// arguments trading places, map_gradient(H, y). The two must sum, which exercises accumulate.
+void test_gradients_laplacian() {
+    for (int d : {2, 5}) {
+        const int f = 3;
+        const Delta delta(n, d, bowtie);
+        Mat maps = Mat::Random(2 * delta.num_edges(), d * d);
+        Mat x = Mat::Random(n * d, f);
+        const Mat H = Mat::Random(n * d, f);
+        const Mat y = apply(delta, maps, x);
+        const Mat gx = apply_transpose(delta, maps, apply(delta, maps, H));
+        Mat gmaps = Mat::Random(2 * delta.num_edges(), d * d);  // stale; the first call overwrites
+        delta.map_gradient(H, y, gmaps);
+        delta.map_gradient(x, apply(delta, maps, H), gmaps, /*accumulate=*/true);
+
+        const auto loss = [&] {
+            return H.cwiseProduct(apply_transpose(delta, maps, apply(delta, maps, x))).sum();
         };
-        double worst = 0;
-        for (Eigen::Index i = 0; i < x.size(); ++i)
-            worst = std::max(worst, std::abs(numeric(x(i)) - gx(i)));
-        for (Eigen::Index i = 0; i < maps.size(); ++i)
-            worst = std::max(worst, std::abs(numeric(maps(i)) - gmaps(i)));
-        CHECK(worst < 1e-8);
+        CHECK(gradient_error(loss, x, gx, 1e-3) < 1e-8);
+        CHECK(gradient_error(loss, maps, gmaps, 1e-3) < 1e-8);
     }
 }
 
@@ -245,6 +293,8 @@ int main() {
     test_global_sections();
     test_orientation_independence();
     test_gradients();
+    test_gradients_linear();
+    test_gradients_laplacian();
     test_float();
     test_rejects_bad_edges();
     if (failures > 0) {

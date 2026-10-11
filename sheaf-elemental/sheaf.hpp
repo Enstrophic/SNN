@@ -48,7 +48,9 @@ public:
 
     // Backward pass to the maps for y = δx, given gy = dLoss/dy:
     //   dLoss/dF_{head(e) ⊴ e} = gy_e x_head(e)^T,   dLoss/dF_{tail(e) ⊴ e} = -gy_e x_tail(e)^T.
-    void map_gradient(const In& x, const In& gy, Out gmaps) const;
+    // By default this overwrites gmaps. With accumulate = true it adds to gmaps instead, so when
+    // the same maps are used more than once, as in δ^T δ, their contributions sum into one buffer.
+    void map_gradient(const In& x, const In& gy, Out gmaps, bool accumulate = false) const;
 
     // δ as an explicit (m*d) x (n*d) sparse matrix, for analysis and testing.
     Eigen::SparseMatrix<T, Eigen::RowMajor> to_sparse(const In& maps) const;

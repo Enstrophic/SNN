@@ -6,6 +6,13 @@
 #include <stdexcept>
 #include <type_traits>
 
+// An OpenMP directive that vanishes from a serial build, where a bare #pragma omp would warn.
+#ifdef _OPENMP
+#define SHEAF_OMP(directive) _Pragma(#directive)
+#else
+#define SHEAF_OMP(directive)
+#endif
+
 namespace sheaf {
 namespace {
 
@@ -76,7 +83,7 @@ void Coboundary<T>::apply(const In& maps, const In& x, Out y) const {
     assert(maps.rows() == 2 * m && maps.cols() == d * d);
     assert(x.rows() == Index(n_) * d && y.rows() == m * d && y.cols() == x.cols());
     dispatch(d, [&]<int D>(std::integral_constant<int, D>) {
-#pragma omp parallel for schedule(static)
+        SHEAF_OMP(omp parallel for schedule(static))
         for (Index e = 0; e < m; ++e) {
             stalk<D>(y, e, d).noalias() =
                 square<D>(maps.row(2 * e + 1).data(), d).lazyProduct(stalk<D>(x, head_[e], d)) -
@@ -98,7 +105,7 @@ void Coboundary<T>::apply_transpose(const In& maps, const In& y, Out x) const {
     assert(maps.rows() == 2 * m && maps.cols() == d * d);
     assert(y.rows() == m * d && x.rows() == Index(n_) * d && x.cols() == y.cols());
     dispatch(d, [&]<int D>(std::integral_constant<int, D>) {
-#pragma omp parallel for schedule(dynamic, 256)
+        SHEAF_OMP(omp parallel for schedule(dynamic, 256))
         for (Index v = 0; v < n_; ++v) {
             auto xv = stalk<D>(x, v, d).transpose();
             xv.setZero();
@@ -117,19 +124,24 @@ void Coboundary<T>::apply_transpose(const In& maps, const In& y, Out x) const {
 }
 
 template <class T>
-void Coboundary<T>::map_gradient(const In& x, const In& gy, Out gmaps) const {
+void Coboundary<T>::map_gradient(const In& x, const In& gy, Out gmaps, bool accumulate) const {
     const Index m = num_edges();
     const int d = d_;
     assert(x.rows() == Index(n_) * d && gy.rows() == m * d && gy.cols() == x.cols());
     assert(gmaps.rows() == 2 * m && gmaps.cols() == d * d);
     dispatch(d, [&]<int D>(std::integral_constant<int, D>) {
-#pragma omp parallel for schedule(static)
+        SHEAF_OMP(omp parallel for schedule(static))
         for (Index e = 0; e < m; ++e) {
             const auto ge = stalk<D>(gy, e, d);
-            square<D>(gmaps.row(2 * e + 1).data(), d).noalias() =
-                ge.lazyProduct(stalk<D>(x, head_[e], d).transpose());
-            square<D>(gmaps.row(2 * e).data(), d).noalias() =
-                -ge.lazyProduct(stalk<D>(x, tail_[e], d).transpose());
+            auto g_head = square<D>(gmaps.row(2 * e + 1).data(), d);
+            auto g_tail = square<D>(gmaps.row(2 * e).data(), d);
+            if (accumulate) {
+                g_head.noalias() += ge.lazyProduct(stalk<D>(x, head_[e], d).transpose());
+                g_tail.noalias() -= ge.lazyProduct(stalk<D>(x, tail_[e], d).transpose());
+            } else {
+                g_head.noalias() = ge.lazyProduct(stalk<D>(x, head_[e], d).transpose());
+                g_tail.noalias() = -ge.lazyProduct(stalk<D>(x, tail_[e], d).transpose());
+            }
         }
     });
 }

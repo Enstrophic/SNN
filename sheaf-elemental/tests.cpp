@@ -111,10 +111,10 @@ void test_kernels_match_matrix() {
     }
 }
 
-// laplacian_apply agrees with the assembled δ^T δ on every dispatch path. Vertex n has no edges,
-// so its rows of Lx must come out zero.
+// laplacian_apply agrees with the assembled δ^T δ on every dispatch path (d = 1..8 unrolled, 9
+// dynamic). Vertex n has no edges, so its rows of Lx must come out zero.
 void test_laplacian() {
-    for (int d = 1; d <= 6; ++d) {
+    for (int d = 1; d <= 9; ++d) {
         const Delta delta(n + 1, d, bowtie);
         const Mat maps = Mat::Random(2 * delta.num_edges(), d * d);
         const Mat dense = delta.to_sparse(maps).toDense();
@@ -149,6 +149,20 @@ void test_strided_views() {
     CHECK(near(l_out.middleCols(1, f), laplacian_apply(delta, maps, x)));
     for (const Mat* out : {&y_out, &x_out, &g_out, &l_out})
         CHECK(out->col(0).isZero(0) && out->col(out->cols() - 1).isZero(0));
+}
+
+// Views of one matrix that share no memory are accepted. Here lx starts in x's last row, right
+// after x's columns, which is exactly where x's span ends; a guard that took the span to be
+// rows * outerStride long would wrongly abort.
+void test_adjacent_views() {
+    const int d = 3, f = 4;
+    const Delta delta(n, d, bowtie);
+    const Mat maps = Mat::Random(2 * delta.num_edges(), d * d), x = Mat::Random(n * d, f);
+    Mat shared = Mat::Zero(2 * n * d, 2 * f);
+    shared.topLeftCorner(n * d, f) = x;
+    delta.laplacian_apply(maps, shared.topLeftCorner(n * d, f),
+                          shared.block(n * d - 1, f, n * d, f));
+    CHECK(near(shared.block(n * d - 1, f, n * d, f), laplacian_apply(delta, maps, x)));
 }
 
 // Gauge-transform the constant sheaf: F_{v ⊴ e} = Q_e P_v^{-1}. Then x_v = P_v c is a global
@@ -319,6 +333,7 @@ int main() {
     test_kernels_match_matrix();
     test_laplacian();
     test_strided_views();
+    test_adjacent_views();
     test_global_sections();
     test_orientation_independence();
     test_gradients();

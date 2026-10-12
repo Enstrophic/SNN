@@ -25,8 +25,9 @@ struct Edge {
 //   y      (m*d) x f     1-cochain; rows [e*d, e*d + d) are the stalk at edge e
 //   maps   (2m) x (d*d)  row 2e is F_{tail(e) ⊴ e} and row 2e + 1 is F_{head(e) ⊴ e}, each
 //                        flattened row-major; map gradients have the same layout
-// f is the number of feature channels. Outputs must be presized and must not alias an input.
-// Instantiated for float and double.
+// f is the number of feature channels. Outputs must be presized and must not share memory with an
+// input, so in-place calls such as laplacian_apply(maps, x, x) are not allowed; debug builds assert
+// this. Instantiated for float and double.
 template <class T>
 class Coboundary {
 public:
@@ -56,7 +57,8 @@ public:
     //   (Lx)_v = Σ_{e ∋ v} F_{v ⊴ e}^T (F_{v ⊴ e} x_v - F_{u ⊴ e} x_u),  u the other endpoint of e.
     // L is symmetric, so the backward pass to x is laplacian_apply(maps, dLoss/dlx, gx). Since
     // ⟨G, Lx⟩ = ⟨δG, δx⟩, the backward pass to the maps given G = dLoss/dlx is map_gradient(G, δx)
-    // plus map_gradient(x, δG), the second with accumulate = true.
+    // plus map_gradient(x, δG), the second with accumulate = true. Usually faster than apply then
+    // apply_transpose, but not on one thread with small f or for d > 8; sheaf.cpp has the numbers.
     void laplacian_apply(const In& maps, const In& x, Out lx) const;
 
     // δ as an explicit (m*d) x (n*d) sparse matrix, for analysis and testing.

@@ -1,10 +1,12 @@
 #include "sheaf.hpp"
 
 #include <cassert>
+#include <cstdint>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <type_traits>
+#include <utility>
 
 // An OpenMP directive that vanishes from a serial build, where a bare #pragma omp would warn.
 #ifdef _OPENMP
@@ -18,17 +20,34 @@ namespace {
 
 using Eigen::Index;
 
-// Runs fn with the stalk dimension as a compile-time constant for the small d used in practice,
-// so Eigen unrolls the d x d products; any other d runs the Eigen::Dynamic instantiation.
-template <class Fn>
+// Runs fn with the stalk dimension as a compile-time constant when d <= MaxD, so the d x d work
+// unrolls; any larger d runs the Eigen::Dynamic instantiation. Each size is a full copy of the
+// kernel, so MaxD is set per kernel to the largest size that measurably helps it.
+template <int MaxD, class Fn>
 void dispatch(int d, Fn&& fn) {
-    switch (d) {
-        case 1: fn(std::integral_constant<int, 1>{}); break;
-        case 2: fn(std::integral_constant<int, 2>{}); break;
-        case 3: fn(std::integral_constant<int, 3>{}); break;
-        case 4: fn(std::integral_constant<int, 4>{}); break;
-        default: fn(std::integral_constant<int, Eigen::Dynamic>{}); break;
+    if constexpr (MaxD == 0) {
+        fn(std::integral_constant<int, Eigen::Dynamic>{});
+    } else if (d == MaxD) {
+        fn(std::integral_constant<int, MaxD>{});
+    } else {
+        dispatch<MaxD - 1>(d, fn);
     }
+}
+
+// Whether two row-major views share memory. A view spans [data, data + (rows - 1) * outerStride
+// + cols), since its last row starts (rows - 1) strides in; for a strided view the span includes
+// the gaps between rows, so disjoint column ranges of one matrix also count as overlapping.
+template <class A, class B>
+bool overlaps(const A& a, const B& b) {
+    if (a.size() == 0 || b.size() == 0) return false;
+    const auto span = [](const auto& v) {
+        const auto first = reinterpret_cast<std::uintptr_t>(v.data());
+        const auto count = (v.rows() - 1) * v.outerStride() + v.cols();
+        return std::pair{first, first + sizeof(*v.data()) * count};
+    };
+    const auto [a_first, a_end] = span(a);
+    const auto [b_first, b_end] = span(b);
+    return a_first < b_end && b_first < a_end;
 }
 
 // The d rows of cochain x over cell i.
@@ -82,7 +101,8 @@ void Coboundary<T>::apply(const In& maps, const In& x, Out y) const {
     const int d = d_;
     assert(maps.rows() == 2 * m && maps.cols() == d * d);
     assert(x.rows() == Index(n_) * d && y.rows() == m * d && y.cols() == x.cols());
-    dispatch(d, [&]<int D>(std::integral_constant<int, D>) {
+    assert(!overlaps(y, x) && !overlaps(y, maps));
+    dispatch<4>(d, [&]<int D>(std::integral_constant<int, D>) {
         SHEAF_OMP(omp parallel for schedule(static))
         for (Index e = 0; e < m; ++e) {
             stalk<D>(y, e, d).noalias() =
@@ -104,7 +124,8 @@ void Coboundary<T>::apply_transpose(const In& maps, const In& y, Out x) const {
     const int d = d_;
     assert(maps.rows() == 2 * m && maps.cols() == d * d);
     assert(y.rows() == m * d && x.rows() == Index(n_) * d && x.cols() == y.cols());
-    dispatch(d, [&]<int D>(std::integral_constant<int, D>) {
+    assert(!overlaps(x, y) && !overlaps(x, maps));
+    dispatch<4>(d, [&]<int D>(std::integral_constant<int, D>) {
         SHEAF_OMP(omp parallel for schedule(dynamic, 256))
         for (Index v = 0; v < n_; ++v) {
             auto xv = stalk<D>(x, v, d).transpose();
@@ -129,7 +150,8 @@ void Coboundary<T>::map_gradient(const In& x, const In& gy, Out gmaps, bool accu
     const int d = d_;
     assert(x.rows() == Index(n_) * d && gy.rows() == m * d && gy.cols() == x.cols());
     assert(gmaps.rows() == 2 * m && gmaps.cols() == d * d);
-    dispatch(d, [&]<int D>(std::integral_constant<int, D>) {
+    assert(!overlaps(gmaps, x) && !overlaps(gmaps, gy));
+    dispatch<4>(d, [&]<int D>(std::integral_constant<int, D>) {
         SHEAF_OMP(omp parallel for schedule(static))
         for (Index e = 0; e < m; ++e) {
             const auto ge = stalk<D>(gy, e, d);
@@ -149,19 +171,26 @@ void Coboundary<T>::map_gradient(const In& x, const In& gy, Out gmaps, bool accu
 // Expanding δ^T δ at vertex v, with u the other endpoint of e, gives L's diagonal and off-diagonal
 // blocks:
 //   (Lx)_v = D_v x_v - Σ_{e ∋ v} F_{v ⊴ e}^T F_{u ⊴ e} x_u,   D_v = Σ_{e ∋ v} F_{v ⊴ e}^T F_{v ⊴ e}.
-// Forming each d x d block costs d^3, small next to the d x f products, and the (m*d) x f cochain
-// δx is never written or read back. As in apply_transpose, every stalk of lx has one writer.
+// This never writes the (m*d) x f cochain δx or reads it back, but pays for that with two d x d
+// products per incident edge, and they are not cheap: at d = 3, f = 16 they cost about as much as
+// the d x f products. Against apply then apply_transpose (20k vertices, 100k edges, d = 3..8):
+//   - several threads, where memory bandwidth limits both: fusing is 1.2-2x faster at every f;
+//   - one thread: it is up to 1.3x slower at f = 8, ties at f = 16, and is 1.2x faster at f >= 32.
+// Past d = 8 the loops run over a runtime d and fusing loses by up to 2x on one thread, so prefer
+// the two calls there unless f is large and several threads run.
 //
-// The d x d products are plain loops. As lazy products, Eigen evaluates each entry of a runtime-
-// sized result as its own reduction, whose setup outweighs the d multiply-adds: 1.6x slower for
-// d = 5..8, and no faster for the unrolled sizes.
+// The d x d products are plain loops because Eigen's lazy products evaluate each entry of a small
+// result as a separate reduction and are 1.6x slower. They are unrolled over a compile-time d up
+// to 8, where the other kernels stop at 4: here that is worth 1.1-1.3x, for them nothing.
+// As in apply_transpose, every stalk of lx has one writer.
 template <class T>
 void Coboundary<T>::laplacian_apply(const In& maps, const In& x, Out lx) const {
     const Index m = num_edges();
     const int d = d_;
     assert(maps.rows() == 2 * m && maps.cols() == d * d);
     assert(x.rows() == Index(n_) * d && lx.rows() == x.rows() && lx.cols() == x.cols());
-    dispatch(d, [&]<int D>(std::integral_constant<int, D>) {
+    assert(!overlaps(lx, x) && !overlaps(lx, maps));
+    dispatch<8>(d, [&]<int D>(std::integral_constant<int, D>) {
         SHEAF_OMP(omp parallel)
         {
             Eigen::Matrix<T, D, D, Eigen::RowMajor> diag(d, d), block(d, d);

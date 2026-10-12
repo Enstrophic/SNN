@@ -52,6 +52,13 @@ public:
     // the same maps are used more than once, as in δ^T δ, their contributions sum into one buffer.
     void map_gradient(const In& x, const In& gy, Out gmaps, bool accumulate = false) const;
 
+    // lx = Lx for the sheaf Laplacian L = δ^T δ, in one pass that never forms δx:
+    //   (Lx)_v = Σ_{e ∋ v} F_{v ⊴ e}^T (F_{v ⊴ e} x_v - F_{u ⊴ e} x_u),  u the other endpoint of e.
+    // L is symmetric, so the backward pass to x is laplacian_apply(maps, dLoss/dlx, gx). Since
+    // ⟨G, Lx⟩ = ⟨δG, δx⟩, the backward pass to the maps given G = dLoss/dlx is map_gradient(G, δx)
+    // plus map_gradient(x, δG), the second with accumulate = true.
+    void laplacian_apply(const In& maps, const In& x, Out lx) const;
+
     // δ as an explicit (m*d) x (n*d) sparse matrix, for analysis and testing.
     Eigen::SparseMatrix<T, Eigen::RowMajor> to_sparse(const In& maps) const;
 

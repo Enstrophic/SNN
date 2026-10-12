@@ -146,6 +146,61 @@ void Coboundary<T>::map_gradient(const In& x, const In& gy, Out gmaps, bool accu
     });
 }
 
+// Expanding δ^T δ at vertex v, with u the other endpoint of e, gives L's diagonal and off-diagonal
+// blocks:
+//   (Lx)_v = D_v x_v - Σ_{e ∋ v} F_{v ⊴ e}^T F_{u ⊴ e} x_u,   D_v = Σ_{e ∋ v} F_{v ⊴ e}^T F_{v ⊴ e}.
+// Forming each d x d block costs d^3, small next to the d x f products, and the (m*d) x f cochain
+// δx is never written or read back. As in apply_transpose, every stalk of lx has one writer.
+//
+// The d x d products are plain loops. As lazy products, Eigen evaluates each entry of a runtime-
+// sized result as its own reduction, whose setup outweighs the d multiply-adds: 1.6x slower for
+// d = 5..8, and no faster for the unrolled sizes.
+template <class T>
+void Coboundary<T>::laplacian_apply(const In& maps, const In& x, Out lx) const {
+    const Index m = num_edges();
+    const int d = d_;
+    assert(maps.rows() == 2 * m && maps.cols() == d * d);
+    assert(x.rows() == Index(n_) * d && lx.rows() == x.rows() && lx.cols() == x.cols());
+    dispatch(d, [&]<int D>(std::integral_constant<int, D>) {
+        SHEAF_OMP(omp parallel)
+        {
+            Eigen::Matrix<T, D, D, Eigen::RowMajor> diag(d, d), block(d, d);
+            SHEAF_OMP(omp for schedule(dynamic, 256))
+            for (Index v = 0; v < n_; ++v) {
+                auto lv = stalk<D>(lx, v, d);
+                lv.setZero();
+                diag.setZero();
+                // Edge e as seen from v: F_{v ⊴ e} is row row_v of maps, F_{u ⊴ e} is row row_u.
+                const auto add_edge = [&](Index row_v, Index row_u, Index u) {
+                    const auto Fv = square<D>(maps.row(row_v).data(), d);
+                    const auto Fu = square<D>(maps.row(row_u).data(), d);
+                    for (Index i = 0; i < Fv.rows(); ++i) {
+                        for (Index j = 0; j < Fv.rows(); ++j) {
+                            T vv = 0, vu = 0;
+                            for (Index k = 0; k < Fv.rows(); ++k) {
+                                vv += Fv(k, i) * Fv(k, j);
+                                vu += Fv(k, i) * Fu(k, j);
+                            }
+                            diag(i, j) += vv;
+                            block(i, j) = vu;
+                        }
+                    }
+                    lv.noalias() -= block.lazyProduct(stalk<D>(x, u, d));
+                };
+                for (int k = in_ptr_[v]; k < in_ptr_[v + 1]; ++k) {
+                    const Index e = in_edges_[k];
+                    add_edge(2 * e + 1, 2 * e, tail_[e]);
+                }
+                for (int k = out_ptr_[v]; k < out_ptr_[v + 1]; ++k) {
+                    const Index e = out_edges_[k];
+                    add_edge(2 * e, 2 * e + 1, head_[e]);
+                }
+                lv.noalias() += diag.lazyProduct(stalk<D>(x, v, d));
+            }
+        }
+    });
+}
+
 template <class T>
 Eigen::SparseMatrix<T, Eigen::RowMajor> Coboundary<T>::to_sparse(const In& maps) const {
     const Index m = num_edges();

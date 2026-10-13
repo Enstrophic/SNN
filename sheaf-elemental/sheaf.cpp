@@ -63,6 +63,24 @@ auto square(T* p, int d) {
     return Eigen::Map<std::conditional_t<std::is_const_v<T>, const M, M>>(p, d, d);
 }
 
+// The d x d products of one edge seen from vertex v: diag += F_v^T F_v and cross = F_v^T F_u. Plain
+// loops, because Eigen's lazy products evaluate each entry of so small a result as a separate
+// reduction and are 1.6x slower; over a compile-time d the loops unroll.
+template <class Map, class Diag, class Cross>
+void gram_blocks(const Map& Fv, const Map& Fu, Diag& diag, Cross& cross) {
+    for (Index i = 0; i < Fv.rows(); ++i) {
+        for (Index j = 0; j < Fv.rows(); ++j) {
+            typename Diag::Scalar vv = 0, vu = 0;
+            for (Index k = 0; k < Fv.rows(); ++k) {
+                vv += Fv(k, i) * Fv(k, j);
+                vu += Fv(k, i) * Fu(k, j);
+            }
+            diag(i, j) += vv;
+            cross(i, j) = vu;
+        }
+    }
+}
+
 // Edge ids grouped by vertex: ids[ptr[v] .. ptr[v + 1]) are the e with endpoint[e] == v, ascending.
 void group_by_vertex(const std::vector<int>& endpoint, int n, std::vector<int>& ptr,
                      std::vector<int>& ids) {
@@ -96,6 +114,19 @@ Coboundary<T>::Coboundary(int num_vertices, int d, std::span<const Edge> edges)
 }
 
 template <class T>
+template <class Visit>
+void Coboundary<T>::for_each_incident(Index v, Visit&& visit) const {
+    for (int k = in_ptr_[v]; k < in_ptr_[v + 1]; ++k) {
+        const Index e = in_edges_[k];
+        visit(2 * e + 1, 2 * e, Index(tail_[e]));
+    }
+    for (int k = out_ptr_[v]; k < out_ptr_[v + 1]; ++k) {
+        const Index e = out_edges_[k];
+        visit(2 * e, 2 * e + 1, Index(head_[e]));
+    }
+}
+
+template <class T>
 void Coboundary<T>::apply(const In& maps, const In& x, Out y) const {
     const Index m = num_edges();
     const int d = d_;
@@ -126,7 +157,7 @@ void Coboundary<T>::apply_transpose(const In& maps, const In& y, Out x) const {
     assert(y.rows() == m * d && x.rows() == Index(n_) * d && x.cols() == y.cols());
     assert(!overlaps(x, y) && !overlaps(x, maps));
     dispatch<4>(d, [&]<int D>(std::integral_constant<int, D>) {
-        SHEAF_OMP(omp parallel for schedule(dynamic, 256))
+        SHEAF_OMP(omp parallel for schedule(dynamic, 32))
         for (Index v = 0; v < n_; ++v) {
             auto xv = stalk<D>(x, v, d).transpose();
             xv.setZero();
@@ -179,10 +210,9 @@ void Coboundary<T>::map_gradient(const In& x, const In& gy, Out gmaps, bool accu
 // Past d = 8 the loops run over a runtime d and fusing loses by up to 2x on one thread, so prefer
 // the two calls there unless f is large and several threads run.
 //
-// The d x d products are plain loops because Eigen's lazy products evaluate each entry of a small
-// result as a separate reduction and are 1.6x slower. They are unrolled over a compile-time d up
-// to 8, where the other kernels stop at 4: here that is worth 1.1-1.3x, for them nothing.
-// As in apply_transpose, every stalk of lx has one writer.
+// The d x d products (gram_blocks) unroll over a compile-time d up to 8, where the other kernels
+// stop at 4: here that is worth 1.1-1.3x, for them nothing. As in apply_transpose, every stalk of
+// lx has one writer.
 template <class T>
 void Coboundary<T>::laplacian_apply(const In& maps, const In& x, Out lx) const {
     const Index m = num_edges();
@@ -193,38 +223,49 @@ void Coboundary<T>::laplacian_apply(const In& maps, const In& x, Out lx) const {
     dispatch<8>(d, [&]<int D>(std::integral_constant<int, D>) {
         SHEAF_OMP(omp parallel)
         {
-            Eigen::Matrix<T, D, D, Eigen::RowMajor> diag(d, d), block(d, d);
-            SHEAF_OMP(omp for schedule(dynamic, 256))
+            Eigen::Matrix<T, D, D, Eigen::RowMajor> diag(d, d), cross(d, d);
+            SHEAF_OMP(omp for schedule(dynamic, 32))
             for (Index v = 0; v < n_; ++v) {
                 auto lv = stalk<D>(lx, v, d);
                 lv.setZero();
                 diag.setZero();
-                // Edge e as seen from v: F_{v ⊴ e} is row row_v of maps, F_{u ⊴ e} is row row_u.
-                const auto add_edge = [&](Index row_v, Index row_u, Index u) {
-                    const auto Fv = square<D>(maps.row(row_v).data(), d);
-                    const auto Fu = square<D>(maps.row(row_u).data(), d);
-                    for (Index i = 0; i < Fv.rows(); ++i) {
-                        for (Index j = 0; j < Fv.rows(); ++j) {
-                            T vv = 0, vu = 0;
-                            for (Index k = 0; k < Fv.rows(); ++k) {
-                                vv += Fv(k, i) * Fv(k, j);
-                                vu += Fv(k, i) * Fu(k, j);
-                            }
-                            diag(i, j) += vv;
-                            block(i, j) = vu;
-                        }
-                    }
-                    lv.noalias() -= block.lazyProduct(stalk<D>(x, u, d));
-                };
-                for (int k = in_ptr_[v]; k < in_ptr_[v + 1]; ++k) {
-                    const Index e = in_edges_[k];
-                    add_edge(2 * e + 1, 2 * e, tail_[e]);
-                }
-                for (int k = out_ptr_[v]; k < out_ptr_[v + 1]; ++k) {
-                    const Index e = out_edges_[k];
-                    add_edge(2 * e, 2 * e + 1, head_[e]);
-                }
+                for_each_incident(v, [&](Index row_v, Index row_u, Index u) {
+                    gram_blocks(square<D>(maps.row(row_v).data(), d),
+                                square<D>(maps.row(row_u).data(), d), diag, cross);
+                    lv.noalias() -= cross.lazyProduct(stalk<D>(x, u, d));
+                });
                 lv.noalias() += diag.lazyProduct(stalk<D>(x, v, d));
+            }
+        }
+    });
+}
+
+// Vertex v owns L's d rows over its stalk. It zeroes them, subtracts F_v^T F_u from the column
+// block of each neighbour u (so parallel edges sum), and writes D_v into its own column block.
+// Every entry has one writer, and the (u, v) block is built from the same products, in the same
+// order, as the (v, u) block, so L comes out exactly symmetric.
+template <class T>
+void Coboundary<T>::dense_laplacian(const In& maps, Out L) const {
+    const Index m = num_edges();
+    const int d = d_;
+    assert(maps.rows() == 2 * m && maps.cols() == d * d);
+    assert(L.rows() == Index(n_) * d && L.cols() == L.rows());
+    assert(!overlaps(L, maps));
+    dispatch<8>(d, [&]<int D>(std::integral_constant<int, D>) {
+        SHEAF_OMP(omp parallel)
+        {
+            Eigen::Matrix<T, D, D, Eigen::RowMajor> diag(d, d), cross(d, d);
+            SHEAF_OMP(omp for schedule(dynamic, 16))
+            for (Index v = 0; v < n_; ++v) {
+                auto rows = stalk<D>(L, v, d);
+                rows.setZero();
+                diag.setZero();
+                for_each_incident(v, [&](Index row_v, Index row_u, Index u) {
+                    gram_blocks(square<D>(maps.row(row_v).data(), d),
+                                square<D>(maps.row(row_u).data(), d), diag, cross);
+                    rows.template middleCols<D>(u * d, d) -= cross;
+                });
+                rows.template middleCols<D>(v * d, d) = diag;
             }
         }
     });

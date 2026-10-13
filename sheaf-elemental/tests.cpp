@@ -67,6 +67,13 @@ Mat laplacian_apply(const Delta& delta, const Mat& maps, const Mat& x) {
     return lx;
 }
 
+Mat dense_laplacian(const Delta& delta, const Mat& maps) {
+    const int nd = delta.num_vertices() * delta.stalk_dim();
+    Mat L(nd, nd);
+    delta.dense_laplacian(maps, L);
+    return L;
+}
+
 // dim ker A, from a rank-revealing LU.
 int nullity(const Mat& A) {
     Eigen::FullPivLU<Eigen::MatrixXd> lu(A);
@@ -125,6 +132,24 @@ void test_laplacian() {
     }
 }
 
+// dense_laplacian agrees with the assembled δ^T δ on every dispatch path. Vertex n is isolated, and
+// a second edge joins 0 and 1, so their blocks must add. L is exactly symmetric, and multiplying by
+// it matches laplacian_apply.
+void test_dense_laplacian() {
+    std::vector<Edge> edges = bowtie;
+    edges.push_back({1, 0});
+    for (int d = 1; d <= 9; ++d) {
+        const Delta delta(n + 1, d, edges);
+        const Mat maps = Mat::Random(2 * delta.num_edges(), d * d);
+        const Mat dense = delta.to_sparse(maps).toDense();
+        const Mat L = dense_laplacian(delta, maps);
+        CHECK(near(L, dense.transpose() * dense));
+        CHECK(L == L.transpose());
+        const Mat x = Mat::Random((n + 1) * d, 5);
+        CHECK(near(L * x, laplacian_apply(delta, maps, x)));
+    }
+}
+
 // Inputs and outputs may be views with an outer stride, such as a column range of a wider matrix,
 // and nothing outside an output view is written.
 void test_strided_views() {
@@ -149,6 +174,12 @@ void test_strided_views() {
     CHECK(near(l_out.middleCols(1, f), laplacian_apply(delta, maps, x)));
     for (const Mat* out : {&y_out, &x_out, &g_out, &l_out})
         CHECK(out->col(0).isZero(0) && out->col(out->cols() - 1).isZero(0));
+
+    Mat L_out = Mat::Zero(n * d + 2, n * d + 2);
+    delta.dense_laplacian(maps_buf.leftCols(d * d), L_out.block(1, 1, n * d, n * d));
+    CHECK(near(L_out.block(1, 1, n * d, n * d), dense_laplacian(delta, maps)));
+    CHECK(L_out.row(0).isZero(0) && L_out.row(n * d + 1).isZero(0));
+    CHECK(L_out.col(0).isZero(0) && L_out.col(n * d + 1).isZero(0));
 }
 
 // Views of one matrix that share no memory are accepted. Here lx starts in x's last row, right
@@ -167,8 +198,8 @@ void test_adjacent_views() {
 
 // Gauge-transform the constant sheaf: F_{v ⊴ e} = Q_e P_v^{-1}. Then x_v = P_v c is a global
 // section for every c in R^d, and on a connected graph there are no others, so dim ker δ = d.
-// Sections are harmonic too, since ker L = ker δ. A generic sheaf on this graph has nontrivial
-// holonomy around the cycles and no sections.
+// Sections are harmonic too, since ker L = ker δ, so L has exactly d zero eigenvalues. A generic
+// sheaf on this graph has nontrivial holonomy around the cycles and no sections.
 void test_global_sections() {
     const int d = 3, f = 2;
     const Delta delta(n, d, bowtie);
@@ -187,6 +218,9 @@ void test_global_sections() {
     CHECK(apply(delta, maps, x).norm() < 1e-10 * x.norm());
     CHECK(laplacian_apply(delta, maps, x).norm() < 1e-10 * x.norm());
     CHECK(nullity(delta.to_sparse(maps).toDense()) == d);
+    const Eigen::VectorXd spectrum =
+        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd>(dense_laplacian(delta, maps)).eigenvalues();
+    CHECK((spectrum.array() < 1e-9 * spectrum.maxCoeff()).count() == d);
     CHECK(nullity(delta.to_sparse(Mat::Random(2 * m, d * d)).toDense()) == 0);
 }
 
@@ -300,15 +334,17 @@ void test_float() {
     const sheaf::Coboundary<float> delta_f(n, d, bowtie);
     const int m = delta.num_edges();
     const Mat maps = Mat::Random(2 * m, d * d), x = Mat::Random(n * d, f), y = Mat::Random(m * d, f);
-    MatF yf(m * d, f), xf(n * d, f), gf(2 * m, d * d), lf(n * d, f);
+    MatF yf(m * d, f), xf(n * d, f), gf(2 * m, d * d), lf(n * d, f), Lf(n * d, n * d);
     delta_f.apply(maps.cast<float>(), x.cast<float>(), yf);
     delta_f.apply_transpose(maps.cast<float>(), y.cast<float>(), xf);
     delta_f.map_gradient(x.cast<float>(), y.cast<float>(), gf);
     delta_f.laplacian_apply(maps.cast<float>(), x.cast<float>(), lf);
+    delta_f.dense_laplacian(maps.cast<float>(), Lf);
     CHECK(near(yf.cast<double>(), apply(delta, maps, x), 1e-5));
     CHECK(near(xf.cast<double>(), apply_transpose(delta, maps, y), 1e-5));
     CHECK(near(gf.cast<double>(), map_gradient(delta, x, y), 1e-5));
     CHECK(near(lf.cast<double>(), laplacian_apply(delta, maps, x), 1e-5));
+    CHECK(near(Lf.cast<double>(), dense_laplacian(delta, maps), 1e-5));
 }
 
 void test_rejects_bad_edges() {
@@ -332,6 +368,7 @@ int main() {
     test_constant_sheaf_is_graph();
     test_kernels_match_matrix();
     test_laplacian();
+    test_dense_laplacian();
     test_strided_views();
     test_adjacent_views();
     test_global_sections();

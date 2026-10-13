@@ -61,10 +61,27 @@ public:
     // apply_transpose, but not on one thread with small f or for d > 8; sheaf.cpp has the numbers.
     void laplacian_apply(const In& maps, const In& x, Out lx) const;
 
+    // L = δ^T δ as a dense (n*d) x (n*d) matrix, so that applying it is one matrix product run by
+    // Eigen's blocked GEMM: lx.noalias() = L * x. Rebuild it whenever the maps change. It holds
+    // (n*d)^2 scalars, and a product costs (n*d)^2 f multiply-adds against about 2 m d^2 f for
+    // laplacian_apply: n / (average degree) times the arithmetic, which GEMM's speed repays only
+    // when L is far from sparse. Measured at d = 3: with 100 vertices of average degree 50 (L half
+    // full) the product is 2-3x faster than laplacian_apply, and still about 2x counting assembly
+    // over a forward and backward pass; at 250 vertices the two tie, and at 500 vertices, or at
+    // average degree 10, laplacian_apply wins every time. The other use is analysis: L comes out
+    // exactly symmetric, so Eigen's self-adjoint solvers accept it, e.g. for the sheaf's spectrum.
+    // The backward passes are those of laplacian_apply, with L * G as the one to x.
+    void dense_laplacian(const In& maps, Out L) const;
+
     // δ as an explicit (m*d) x (n*d) sparse matrix, for analysis and testing.
     Eigen::SparseMatrix<T, Eigen::RowMajor> to_sparse(const In& maps) const;
 
 private:
+    // Calls visit(row_v, row_u, u) for each edge e at vertex v, where rows row_v and row_u of maps
+    // hold F_{v ⊴ e} and F_{u ⊴ e} and u is the other endpoint of e.
+    template <class Visit>
+    void for_each_incident(Eigen::Index v, Visit&& visit) const;
+
     int n_;
     int d_;
     std::vector<int> tail_, head_;
